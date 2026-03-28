@@ -124,20 +124,11 @@ impl Drop for EventLoopManager {
 
 /// Background thread that runs the CFRunLoop to service DNS-SD events.
 fn event_loop_thread_run(stop_rx: mpsc::Receiver<()>, add_source_rx: mpsc::Receiver<AddSourceRequest>) {
-    // Each thread has its own CFRunLoop. Use current() on this background thread,
-    // not main() which would return the main thread's runloop.
+    // Use the background thread's own CFRunLoop
     let runloop = CFRunLoop::current().unwrap();
     
     loop {
-        // Check if we've been signaled to stop
-        match stop_rx.try_recv() {
-            Ok(_) | Err(mpsc::TryRecvError::Disconnected) => break,
-            Err(mpsc::TryRecvError::Empty) => {
-                // Continue running
-            }
-        }
-        
-        // Check for pending source requests
+        // Process pending source requests
         loop {
             match add_source_rx.try_recv() {
                 Ok(request) => {
@@ -149,9 +140,17 @@ fn event_loop_thread_run(stop_rx: mpsc::Receiver<()>, add_source_rx: mpsc::Recei
             }
         }
         
-        // Run the event loop with a 100ms timeout to check for stop signal
-        unsafe {
-            CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, 0.1, false);
+        // Check if we've been signaled to stop
+        match stop_rx.try_recv() {
+            Ok(_) | Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {
+                // Continue running - but actually run the event loop to process callbacks
+                unsafe {
+                    // Run ONE iteration of the runloop with a timeout.
+                    // This allows pending DNS-SD callbacks to fire.
+                    CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, 0.01, true);
+                }
+            }
         }
     }
 }
