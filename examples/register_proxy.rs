@@ -12,10 +12,12 @@ fn register_ipv4_proxy() {
     // Port is ignored for the A record; use 0.
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut rec = conn.register_record("myproxy.local", addr).unwrap();
+    println!("DNS record requested");
 
     // Wait for the registration callback to confirm the record is registered
     // This ensures the record is actively responding to DNS queries before proceeding
-    rec.wait_for_registration().unwrap();
+    // rec.wait_for_registration().unwrap();
+    // println!("DNS record registered successfully");
 
     // let _svc = DNSService::register(
     //     Some("My Web Server"),
@@ -27,10 +29,10 @@ fn register_ipv4_proxy() {
     // )
     // .unwrap();
 
-    println!("IPv4 proxy advertisement active for 30 seconds...");
+    println!("IPv4 proxy advertisement active for 10 seconds...");
     // The event loop runs automatically in the background.
     // Just keep the DNSService values alive and sleep.
-    thread::sleep(Duration::from_secs(30));
+    thread::sleep(Duration::from_secs(10));
 }
 
 /// Link-local IPv6 proxy — equivalent of:
@@ -64,10 +66,10 @@ fn register_ipv6_proxy() {
     )
     .unwrap();
 
-    println!("IPv6 proxy advertisement active for 30 seconds...");
+    println!("IPv6 proxy advertisement active for 10 seconds...");
     // The event loop runs automatically in the background.
     // Just keep the DNSService values alive and sleep.
-    thread::sleep(Duration::from_secs(30));
+    thread::sleep(Duration::from_secs(10));
 }
 
 fn main() {
