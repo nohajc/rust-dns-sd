@@ -50,7 +50,8 @@ unsafe extern "C-unwind" fn socket_callback(
     }
 }
 
-enum BackgroundThreadRequest {
+/// One-time initialization request sent to background thread
+enum BackgroundThreadInitRequest {
     Register {
         name: Option<String>,
         regtype: String,
@@ -63,20 +64,12 @@ enum BackgroundThreadRequest {
     CreateConnection {
         response_tx: mpsc::Sender<Result<ffi::DNSServiceRef, DNSError>>,
     },
-    RegisterRecord {
-        sd_ref: ffi::DNSServiceRef,
-        fullname: String,
-        addr: SocketAddr,
-        response_tx: mpsc::Sender<Result<ffi::DNSRecordRef, DNSError>>,
-        callback_tx: mpsc::Sender<ffi::DNSServiceErrorType>,
-    },
 }
 
-unsafe impl Send for BackgroundThreadRequest {}
+unsafe impl Send for BackgroundThreadInitRequest {}
 
 struct EventLoopManager {
-    request_tx: mpsc::Sender<BackgroundThreadRequest>,
-    _thread_handle: Option<thread::JoinHandle<()>>,
+    request_tx: mpsc::Sender<BackgroundThreadInitRequest>,
 }
 
 impl std::fmt::Debug for EventLoopManager {
@@ -87,63 +80,42 @@ impl std::fmt::Debug for EventLoopManager {
 
 impl EventLoopManager {
     fn new() -> Arc<Self> {
-        let (request_tx, request_rx) = mpsc::channel();
+        let (request_tx, init_rx) = mpsc::channel();
 
-        let handle = thread::spawn(move || {
-            background_thread_main(request_rx);
+        let _ = thread::spawn(move || {
+            background_thread_main(init_rx);
         });
 
-        Arc::new(EventLoopManager {
-            request_tx,
-            _thread_handle: Some(handle),
-        })
+        Arc::new(EventLoopManager { request_tx })
     }
 }
 
 impl Drop for EventLoopManager {
     fn drop(&mut self) {
-        if let Some(handle) = self._thread_handle.take() {
-            // Request channel closes when this EventLoopManager is dropped,
-            // which will cause the background thread to exit
-            let _ = handle.join();
-        }
+        // Background thread runs forever via CFRunLoop::run(), no need to stop it.
+        // The thread will exit when the process terminates.
     }
 }
 
-fn background_thread_main(request_rx: mpsc::Receiver<BackgroundThreadRequest>) {
+fn background_thread_main(init_rx: mpsc::Receiver<BackgroundThreadInitRequest>) {
     let runloop = CFRunLoop::current().unwrap();
 
-    loop {
-        // Block with 10ms timeout waiting for requests
-        // If timeout occurs, run CFRunLoop briefly to process callbacks
-        match request_rx.recv_timeout(std::time::Duration::from_millis(10)) {
-            Ok(request) => {
-                match request {
-                    BackgroundThreadRequest::Register { name, regtype, domain, host, port, txt, response_tx } => {
-                        let result = unsafe { dns_service_register(&name, &regtype, &domain, &host, port, &txt) };
-                        let _ = response_tx.send(result);
-                    }
-                    BackgroundThreadRequest::CreateConnection { response_tx } => {
-                        let result = unsafe { dns_service_create_connection() };
-                        let _ = response_tx.send(result);
-                    }
-                    BackgroundThreadRequest::RegisterRecord { sd_ref, fullname, addr, response_tx, callback_tx } => {
-                        let result = unsafe { dns_service_register_record(sd_ref, &fullname, addr, &runloop, callback_tx) };
-                        let _ = response_tx.send(result);
-                    }
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Timeout - run CFRunLoop briefly to process callbacks
-                unsafe {
-                    CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, 0.001, true);
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // All senders dropped, exit
-                return;
-            }
+    // Wait for one initialization request
+    match init_rx.recv() {
+        Ok(BackgroundThreadInitRequest::Register { name, regtype, domain, host, port, txt, response_tx }) => {
+            let result = unsafe { dns_service_register(&name, &regtype, &domain, &host, port, &txt) };
+            let _ = response_tx.send(result);
         }
+        Ok(BackgroundThreadInitRequest::CreateConnection { response_tx }) => {
+            let result = unsafe { dns_service_create_connection_with_runloop(&runloop) };
+            let _ = response_tx.send(result);
+        }
+        Err(_) => return, // Channel closed before init request
+    }
+
+    // Now run the event loop forever to process all callbacks
+    unsafe {
+        CFRunLoop::run();
     }
 }
 
@@ -191,26 +163,14 @@ unsafe fn dns_service_register(
     }
 }
 
-unsafe fn dns_service_create_connection() -> Result<ffi::DNSServiceRef, DNSError> {
+unsafe fn dns_service_create_connection_with_runloop(runloop: &CFRunLoop) -> Result<ffi::DNSServiceRef, DNSError> {
     let mut sd_ref: ffi::DNSServiceRef = null_mut();
     let err = unsafe { ffi::DNSServiceCreateConnection(&mut sd_ref) };
     if err != ffi::DNSServiceErrorType::NoError {
         return Err(DNSError(err));
     }
-    Ok(sd_ref)
-}
 
-unsafe fn dns_service_register_record(
-    sd_ref: ffi::DNSServiceRef,
-    fullname: &str,
-    addr: SocketAddr,
-    runloop: &CFRunLoop,
-    callback_tx: mpsc::Sender<ffi::DNSServiceErrorType>,
-) -> Result<ffi::DNSRecordRef, DNSError> {
-    let mut rec_ref: ffi::DNSRecordRef = null_mut();
-    let fullname_c = CString::new(fullname).unwrap();
-
-    // Register the socket source BEFORE calling DNSServiceRegisterRecord
+    // Register the socket source with the CFRunLoop
     let fd = unsafe { ffi::DNSServiceRefSockFD(sd_ref) };
     if fd < 0 {
         return Err(DNSError(ffi::DNSServiceErrorType::Unknown));
@@ -254,11 +214,23 @@ unsafe fn dns_service_register_record(
     }
     std::mem::forget(cf_sock);
 
-    // Now register the record
-    
-    // Box the callback sender to pass as context
+    Ok(sd_ref)
+}
+
+/// Register a DNS record directly. Called from main thread after create_connection has
+/// set up the socket on the background thread's CFRunLoop.
+unsafe fn dns_service_register_record_direct(
+    sd_ref: ffi::DNSServiceRef,
+    fullname: &str,
+    addr: SocketAddr,
+    callback_tx: mpsc::Sender<ffi::DNSServiceErrorType>,
+) -> Result<ffi::DNSRecordRef, DNSError> {
+    let mut rec_ref: ffi::DNSRecordRef = null_mut();
+    let fullname_c = CString::new(fullname).unwrap();
+
+    // Box the callback sender to pass as context to the DNS-SD callback
     let context_ptr = Box::into_raw(Box::new(callback_tx)) as *mut c_void;
-    
+
     let err = match addr {
         SocketAddr::V4(a) => {
             let raw_ip = a.ip().octets();
@@ -299,7 +271,7 @@ unsafe fn dns_service_register_record(
             }
         }
     };
-    
+
     if err != ffi::DNSServiceErrorType::NoError {
         // Clean up context if registration failed
         unsafe {
@@ -307,10 +279,7 @@ unsafe fn dns_service_register_record(
         }
         return Err(DNSError(err));
     }
-    
-    // Return immediately - the main thread will wait for callback completion
-    // The context (callback_tx) is now owned by the DNS-SD library and will be consumed
-    // by the callback when it fires
+
     Ok(rec_ref)
 }
 
@@ -627,7 +596,7 @@ impl DNSService {
         let event_loop = get_event_loop_manager();
         let (response_tx, response_rx) = mpsc::channel();
 
-        let request = BackgroundThreadRequest::Register {
+        let request = BackgroundThreadInitRequest::Register {
             name: name.map(|s| s.to_string()),
             regtype: regtype.to_string(),
             domain: domain.map(|s| s.to_string()),
@@ -652,16 +621,20 @@ impl DNSService {
     /// service on behalf of another host. You can then use [`register_record`](Self::register_record)
     /// to register individual address records (A or AAAA) for that service.
     ///
+    /// This method blocks briefly to initialize the background event loop thread and set up
+    /// the DNS-SD socket with CFRunLoop. After this returns, DNS callbacks will be processed
+    /// automatically in the background.
+    ///
     /// # Example
     ///
     /// ```ignore
     /// use dns_sd::DNSService;
     /// use std::net::SocketAddr;
     ///
-    /// // Create a connection for proxy records
+    /// // Create a connection for proxy records (blocks briefly)
     /// let conn = DNSService::create_connection()?;
     ///
-    /// // Register an address record
+    /// // Register an address record (non-blocking)
     /// let addr: SocketAddr = "192.0.2.100:0".parse()?;
     /// let _record = conn.register_record("myhost.local.", addr)?;
     ///
@@ -687,7 +660,7 @@ impl DNSService {
         let event_loop = get_event_loop_manager();
         let (response_tx, response_rx) = mpsc::channel();
 
-        let request = BackgroundThreadRequest::CreateConnection { response_tx };
+        let request = BackgroundThreadInitRequest::CreateConnection { response_tx };
 
         event_loop.request_tx.send(request).map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))?;
         let sd_ref = response_rx.recv().map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))??;
@@ -700,11 +673,10 @@ impl DNSService {
 
     /// Register an address record (A for IPv4, AAAA for IPv6) on this connection.
     ///
-    /// This method registers a DNS address record and returns immediately—the record
-    /// registration proceeds asynchronously. To wait for the registration callback to
-    /// confirm completion (ensuring the record is actively responding to DNS queries),
-    /// call [`wait_for_registration()`](DNSRecord::wait_for_registration) on the returned
-    /// [`DNSRecord`].
+    /// This method returns immediately—the record registration proceeds asynchronously.
+    /// To wait for the registration callback to confirm completion (ensuring the record is
+    /// actively responding to DNS queries), call [`wait_for_registration()`](DNSRecord::wait_for_registration)
+    /// on the returned [`DNSRecord`].
     ///
     /// # Arguments
     ///
@@ -752,25 +724,17 @@ impl DNSService {
     /// # Returns
     ///
     /// Returns a [`DNSRecord`] on success, which must be kept alive to maintain the
-    /// registration. Returns a [`DNSError`] if the initial registration request fails.
+    /// registration. Returns a [`DNSError`] if the registration request fails.
     pub fn register_record(
         &self,
         fullname: &str,
         addr: SocketAddr,
     ) -> Result<DNSRecord, DNSError> {
-        let (response_tx, response_rx) = mpsc::channel();
         let (callback_tx, callback_rx) = mpsc::channel();
 
-        let request = BackgroundThreadRequest::RegisterRecord {
-            sd_ref: self.sd_ref,
-            fullname: fullname.to_string(),
-            addr,
-            response_tx,
-            callback_tx,
+        let rec_ref = unsafe {
+            dns_service_register_record_direct(self.sd_ref, fullname, addr, callback_tx)?
         };
-
-        self._event_loop.request_tx.send(request).map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))?;
-        let rec_ref = response_rx.recv().map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))??;
 
         Ok(DNSRecord {
             sd_ref: self.sd_ref,
