@@ -11,7 +11,11 @@ fn register_ipv4_proxy() {
 
     // Port is ignored for the A record; use 0.
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let _rec = conn.register_record("myproxy.local", addr).unwrap();
+    let mut rec = conn.register_record("myproxy.local", addr).unwrap();
+
+    // Wait for the registration callback to confirm the record is registered
+    // This ensures the record is actively responding to DNS queries before proceeding
+    rec.wait_for_registration().unwrap();
 
     // let _svc = DNSService::register(
     //     Some("My Web Server"),

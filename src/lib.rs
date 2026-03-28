@@ -509,6 +509,50 @@ pub struct DNSRecord {
     sd_ref: ffi::DNSServiceRef,
     rec_ref: ffi::DNSRecordRef,
     _event_loop: Arc<EventLoopManager>,
+    callback_rx: mpsc::Receiver<ffi::DNSServiceErrorType>,
+}
+
+impl DNSRecord {
+    /// Wait for the DNS record registration callback to complete.
+    ///
+    /// This method blocks until the DNS-SD library confirms that the record has been
+    /// registered. It's safe to call after `register_record()` returns, and can be
+    /// used to ensure the record is fully registered before performing operations that
+    /// depend on DNS resolution (like network mounting).
+    ///
+    /// If the registration encountered an error, this returns that error. If the
+    /// callback has already fired before this method is called, it returns immediately.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if registration completed successfully, or a [`DNSError`]
+    /// if registration failed or communication with the callback failed.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use dns_sd::DNSService;
+    /// use std::net::SocketAddr;
+    ///
+    /// let conn = DNSService::create_connection()?;
+    /// let addr: SocketAddr = "192.0.2.1:0".parse()?;
+    /// let mut record = conn.register_record("myhost.local.", addr)?;
+    ///
+    /// // Record is returned immediately, but registration might still be pending
+    /// // Wait for the callback to confirm registration
+    /// record.wait_for_registration()?;
+    ///
+    /// // Now safe to mount NFS or perform other DNS-dependent operations
+    /// ```
+    pub fn wait_for_registration(&mut self) -> Result<(), DNSError> {
+        let callback_result = self.callback_rx.recv()
+            .map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))?;
+
+        if callback_result != ffi::DNSServiceErrorType::NoError {
+            return Err(DNSError(callback_result));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for DNSRecord {
@@ -656,10 +700,11 @@ impl DNSService {
 
     /// Register an address record (A for IPv4, AAAA for IPv6) on this connection.
     ///
-    /// This method registers a DNS address record that will respond to queries for the
-    /// specified fully-qualified domain name. **This call blocks the caller until the
-    /// DNS-SD callback confirms the registration is complete.** This ensures safe ordering
-    /// for subsequent operations like network mounting.
+    /// This method registers a DNS address record and returns immediately—the record
+    /// registration proceeds asynchronously. To wait for the registration callback to
+    /// confirm completion (ensuring the record is actively responding to DNS queries),
+    /// call [`wait_for_registration()`](DNSRecord::wait_for_registration) on the returned
+    /// [`DNSRecord`].
     ///
     /// # Arguments
     ///
@@ -670,12 +715,13 @@ impl DNSService {
     ///   a scope ID (e.g., `"fe80::1%en0"`), the scope ID becomes the interface index
     ///   passed to the DNS-SD library.
     ///
-    /// # Blocking Behavior
+    /// # Non-blocking Behavior
     ///
-    /// This method blocks the calling thread (typically main) until the DNS-SD registration
-    /// callback fires, confirming the record has been registered. This prevents race
-    /// conditions where subsequent code might proceed before DNS queries are being answered.
-    /// The background event loop thread continues processing normally during this wait.
+    /// This method returns immediately without waiting for the DNS-SD registration callback.
+    /// The record registration proceeds asynchronously in the background. If you need to
+    /// ensure the record is fully registered before proceeding (e.g., before mounting NFS),
+    /// call [`wait_for_registration()`](DNSRecord::wait_for_registration) on the returned
+    /// object.
     ///
     /// # Lifetime Requirements
     ///
@@ -692,27 +738,21 @@ impl DNSService {
     /// ```ignore
     /// use dns_sd::DNSService;
     /// use std::net::SocketAddr;
-    /// use std::thread;
-    /// use std::time::Duration;
     ///
-    /// // CORRECT: Keep the record alive
     /// let conn = DNSService::create_connection()?;
     /// let addr: SocketAddr = "192.0.2.1:0".parse()?;
-    /// let _record = conn.register_record("myhost.local.", addr)?;  // Store in variable
+    /// let mut record = conn.register_record("myhost.local.", addr)?;
     ///
-    /// // The record is now registered and responding to DNS queries
-    /// thread::sleep(Duration::from_secs(30));
-    /// // Record is unregistered when _record is dropped
-    ///
-    /// // WRONG: Record is immediately unregistered
-    /// let _addr: SocketAddr = "192.0.2.2:0".parse()?;
-    /// conn.register_record("other.local.", _addr)?;  // Record unregistered immediately!
+    /// // Record returned immediately, but registration might still be pending
+    /// // Wait for callback completion if needed (e.g., before mounting)
+    /// record.wait_for_registration()?;
+    /// // Now safe to mount NFS or perform other DNS-dependent operations
     /// ```
     ///
     /// # Returns
     ///
     /// Returns a [`DNSRecord`] on success, which must be kept alive to maintain the
-    /// registration. Returns a [`DNSError`] if the registration fails.
+    /// registration. Returns a [`DNSError`] if the initial registration request fails.
     pub fn register_record(
         &self,
         fullname: &str,
@@ -731,17 +771,12 @@ impl DNSService {
 
         self._event_loop.request_tx.send(request).map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))?;
         let rec_ref = response_rx.recv().map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))??;
-        
-        let callback_result = callback_rx.recv().map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))?;
-        
-        if callback_result != ffi::DNSServiceErrorType::NoError {
-            return Err(DNSError(callback_result));
-        }
 
         Ok(DNSRecord {
             sd_ref: self.sd_ref,
             rec_ref,
             _event_loop: self._event_loop.clone(),
+            callback_rx,
         })
     }
 }
