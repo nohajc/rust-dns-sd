@@ -20,9 +20,9 @@ extern "C" fn register_record_callback(
     context: *mut c_void,
 ) {
     if error != ffi::DNSServiceErrorType::NoError {
-        eprintln!("DNSServiceRegisterRecord callback error: {:?}", error);
+        // Callback error occurred
     } else {
-        println!("DNSServiceRegisterRecord callback: record registered successfully.");
+        // Callback succeeded
     }
     
     // Send the error code (or success) on the channel, consuming the sender
@@ -43,12 +43,10 @@ unsafe extern "C-unwind" fn socket_callback(
     _data: *const std::ffi::c_void,
     info: *mut std::ffi::c_void,
 ) {
-    eprintln!("[CALLBACK] socket_callback invoked!");
     let sd_ref = info as ffi::DNSServiceRef;
     let err = unsafe { ffi::DNSServiceProcessResult(sd_ref) };
-    eprintln!("[CALLBACK] DNSServiceProcessResult returned: {:?}", err);
     if err != ffi::DNSServiceErrorType::NoError {
-        eprintln!("DNSServiceProcessResult error: {:?}", err);
+        // Process result error occurred
     }
 }
 
@@ -89,14 +87,11 @@ impl std::fmt::Debug for EventLoopManager {
 
 impl EventLoopManager {
     fn new() -> Arc<Self> {
-        eprintln!("[INIT] EventLoopManager::new() started");
         let (request_tx, request_rx) = mpsc::channel();
-        eprintln!("[INIT] Channels created");
         
         let handle = thread::spawn(move || {
             background_thread_main(request_rx);
         });
-        eprintln!("[INIT] Background thread spawned");
         
         Arc::new(EventLoopManager {
             request_tx,
@@ -116,9 +111,7 @@ impl Drop for EventLoopManager {
 }
 
 fn background_thread_main(request_rx: mpsc::Receiver<BackgroundThreadRequest>) {
-    eprintln!("[BG] Background thread started");
     let runloop = CFRunLoop::current().unwrap();
-    eprintln!("[BG] Got CFRunLoop: {:?}", runloop);
     
     loop {
         // Process all pending requests
@@ -127,37 +120,30 @@ fn background_thread_main(request_rx: mpsc::Receiver<BackgroundThreadRequest>) {
                 Ok(request) => {
                     match request {
                         BackgroundThreadRequest::Register { name, regtype, domain, host, port, txt, response_tx } => {
-                            eprintln!("[BG] Processing Register request: {} type={}", name.as_deref().unwrap_or("(auto)"), regtype);
                             let result = unsafe { dns_service_register(&name, &regtype, &domain, &host, port, &txt) };
                             let _ = response_tx.send(result);
                         }
                         BackgroundThreadRequest::CreateConnection { response_tx } => {
-                            eprintln!("[BG] Processing CreateConnection request");
                             let result = unsafe { dns_service_create_connection() };
                             let _ = response_tx.send(result);
                         }
                         BackgroundThreadRequest::RegisterRecord { sd_ref, fullname, addr, response_tx, callback_tx } => {
-                            eprintln!("[BG] Processing RegisterRecord request: fullname={}, addr={}", fullname, addr);
                             let result = unsafe { dns_service_register_record(sd_ref, &fullname, addr, &runloop, callback_tx) };
-                            eprintln!("[BG] RegisterRecord completed: {:?}", result.is_ok());
                             let _ = response_tx.send(result);
                         }
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    eprintln!("[BG] Request channel disconnected, exiting background thread");
                     return;
                 }
             }
         }
         
         // Run the runloop briefly to process callbacks
-        // eprintln!("[BG] Running CFRunLoop::run_in_mode for 10ms");
         unsafe {
             CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, 0.01, true);
         }
-        // eprintln!("[BG] CFRunLoop::run_in_mode returned");
     }
 }
 
@@ -224,13 +210,9 @@ unsafe fn dns_service_register_record(
     let mut rec_ref: ffi::DNSRecordRef = null_mut();
     let fullname_c = CString::new(fullname).unwrap();
 
-    eprintln!("[DNS] register_record: fullname={}, addr={}", fullname, addr);
-
     // Register the socket source BEFORE calling DNSServiceRegisterRecord
     let fd = unsafe { ffi::DNSServiceRefSockFD(sd_ref) };
-    eprintln!("[DNS] Socket FD: {}", fd);
     if fd < 0 {
-        eprintln!("[DNS] Invalid FD!");
         return Err(DNSError(ffi::DNSServiceErrorType::Unknown));
     }
 
@@ -242,7 +224,6 @@ unsafe fn dns_service_register_record(
         copyDescription: None,
     };
 
-    eprintln!("[DNS] Creating CFSocket...");
     let cf_sock = match unsafe {
         CFSocket::with_native(
             kCFAllocatorDefault,
@@ -252,41 +233,28 @@ unsafe fn dns_service_register_record(
             &mut context,
         )
     } {
-        Some(sock) => {
-            eprintln!("[DNS] CFSocket created successfully");
-            sock
-        }
+        Some(sock) => sock,
         None => {
-            eprintln!("[DNS] Failed to create CFSocket");
             return Err(DNSError(ffi::DNSServiceErrorType::Unknown));
         }
     };
 
     let sock_ref: &objc2_core_foundation::CFSocket = cf_sock.as_ref();
-    eprintln!("[DNS] Creating runloop source...");
     let rl_source = match unsafe {
         CFSocket::new_run_loop_source(kCFAllocatorDefault, Some(sock_ref), 0)
     } {
-        Some(src) => {
-            eprintln!("[DNS] Runloop source created successfully");
-            src
-        }
+        Some(src) => src,
         None => {
-            eprintln!("[DNS] Failed to create runloop source");
             return Err(DNSError(ffi::DNSServiceErrorType::Unknown));
         }
     };
 
-    eprintln!("[DNS] Adding source to runloop...");
     unsafe {
         runloop.add_source(Some(&rl_source), kCFRunLoopDefaultMode);
     }
-    eprintln!("[DNS] Source added to runloop");
     std::mem::forget(cf_sock);
-    eprintln!("[DNS] CFSocket leaked (intentional)");
 
     // Now register the record
-    eprintln!("[DNS] Calling DNSServiceRegisterRecord...");
     
     // Box the callback sender to pass as context
     let context_ptr = Box::into_raw(Box::new(callback_tx)) as *mut c_void;
@@ -331,11 +299,8 @@ unsafe fn dns_service_register_record(
             }
         }
     };
-
-    eprintln!("[DNS] DNSServiceRegisterRecord returned: {:?}", err);
     
     if err != ffi::DNSServiceErrorType::NoError {
-        eprintln!("[DNS] Record registration failed!");
         // Clean up context if registration failed
         unsafe {
             let _ = Box::from_raw(context_ptr as *mut mpsc::Sender<ffi::DNSServiceErrorType>);
@@ -346,19 +311,12 @@ unsafe fn dns_service_register_record(
     // Return immediately - the main thread will wait for callback completion
     // The context (callback_tx) is now owned by the DNS-SD library and will be consumed
     // by the callback when it fires
-    eprintln!("[DNS] Record registered, waiting for callback on main thread");
     Ok(rec_ref)
 }
 
 fn get_event_loop_manager() -> Arc<EventLoopManager> {
     static MANAGER: OnceLock<Arc<EventLoopManager>> = OnceLock::new();
-    eprintln!("[INIT] Getting or initializing EventLoopManager");
-    let result = MANAGER.get_or_init(|| {
-        eprintln!("[INIT] Creating new EventLoopManager");
-        EventLoopManager::new()
-    }).clone();
-    eprintln!("[INIT] EventLoopManager ready");
-    result
+    MANAGER.get_or_init(|| EventLoopManager::new()).clone()
 }
 
 #[allow(non_upper_case_globals)]
@@ -622,7 +580,6 @@ impl DNSService {
         port: u16,
         txt: &[&str],
     ) -> Result<DNSService, DNSError> {
-        eprintln!("[API] register() called: name={:?}, regtype={}", name, regtype);
         let event_loop = get_event_loop_manager();
         let (response_tx, response_rx) = mpsc::channel();
 
@@ -636,11 +593,8 @@ impl DNSService {
             response_tx,
         };
 
-        eprintln!("[API] Sending register request to background thread");
         event_loop.request_tx.send(request).map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))?;
-        eprintln!("[API] Waiting for response...");
         let sd_ref = response_rx.recv().map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))??;
-        eprintln!("[API] register() succeeded");
 
         Ok(DNSService {
             sd_ref,
@@ -686,17 +640,13 @@ impl DNSService {
     /// Returns a [`DNSService`] that can be used to register DNS records, or a
     /// [`DNSError`] if the connection cannot be created.
     pub fn create_connection() -> Result<DNSService, DNSError> {
-        eprintln!("[API] create_connection() called");
         let event_loop = get_event_loop_manager();
         let (response_tx, response_rx) = mpsc::channel();
 
         let request = BackgroundThreadRequest::CreateConnection { response_tx };
 
-        eprintln!("[API] Sending create_connection request to background thread");
         event_loop.request_tx.send(request).map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))?;
-        eprintln!("[API] Waiting for response...");
         let sd_ref = response_rx.recv().map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))??;
-        eprintln!("[API] create_connection() succeeded");
 
         Ok(DNSService {
             sd_ref,
@@ -768,7 +718,6 @@ impl DNSService {
         fullname: &str,
         addr: SocketAddr,
     ) -> Result<DNSRecord, DNSError> {
-        eprintln!("[API] register_record() called: fullname={}, addr={}", fullname, addr);
         let (response_tx, response_rx) = mpsc::channel();
         let (callback_tx, callback_rx) = mpsc::channel();
 
@@ -780,20 +729,14 @@ impl DNSService {
             callback_tx,
         };
 
-        eprintln!("[API] Sending register_record request to background thread");
         self._event_loop.request_tx.send(request).map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))?;
-        eprintln!("[API] Waiting for registration response...");
         let rec_ref = response_rx.recv().map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))??;
         
-        eprintln!("[API] Waiting for callback completion...");
         let callback_result = callback_rx.recv().map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))?;
         
         if callback_result != ffi::DNSServiceErrorType::NoError {
-            eprintln!("[API] Callback returned error: {:?}", callback_result);
             return Err(DNSError(callback_result));
         }
-        
-        eprintln!("[API] register_record() succeeded");
 
         Ok(DNSRecord {
             sd_ref: self.sd_ref,
