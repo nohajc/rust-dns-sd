@@ -2,6 +2,7 @@ extern crate dns_sd;
 use dns_sd::DNSService;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
+use std::thread;
 
 /// Plain IPv4 proxy — equivalent of:
 ///   dns-sd -P "My Web Server" _http._tcp local 80 myproxy.local 192.0.2.1
@@ -22,8 +23,10 @@ fn register_ipv4_proxy() {
     )
     .unwrap();
 
-    println!("IPv4 proxy advertisement active.");
-    std::thread::sleep(Duration::from_secs(30));
+    println!("IPv4 proxy advertisement active for 30 seconds...");
+    // The event loop runs automatically in the background.
+    // Just keep the DNSService values alive and sleep.
+    thread::sleep(Duration::from_secs(30));
 }
 
 /// Link-local IPv6 proxy — equivalent of:
@@ -57,8 +60,10 @@ fn register_ipv6_proxy() {
     )
     .unwrap();
 
-    println!("IPv6 proxy advertisement active.");
-    std::thread::sleep(Duration::from_secs(30));
+    println!("IPv6 proxy advertisement active for 30 seconds...");
+    // The event loop runs automatically in the background.
+    // Just keep the DNSService values alive and sleep.
+    thread::sleep(Duration::from_secs(30));
 }
 
 fn main() {

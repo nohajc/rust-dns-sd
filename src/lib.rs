@@ -1,4 +1,16 @@
-// Minimal callback for DNSServiceRegisterRecord (required by API)
+use std::ffi::CString;
+use std::ffi::c_void;
+use std::net::SocketAddr;
+use std::ptr::null;
+use std::ptr::null_mut;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::sync::mpsc;
+
+use objc2_core_foundation::kCFRunLoopDefaultMode;
+use objc2_core_foundation::{CFRunLoop, CFSocket, CFSocketContext, kCFAllocatorDefault};
+
+// Callback for DNSServiceRegisterRecord - just logs, doesn't stop runloop
 extern "C" fn register_record_callback(
     _sdref: ffi::DNSServiceRef,
     _rec: ffi::DNSRecordRef,
@@ -11,18 +23,185 @@ extern "C" fn register_record_callback(
     } else {
         println!("DNSServiceRegisterRecord callback: record registered successfully.");
     }
-
-    CFRunLoop::stop(&CFRunLoop::main().unwrap());
+    
+    // NOTE: Do NOT call CFRunLoop::stop() here!
+    // The runloop must keep running to service the registered DNS records.
 }
 
-use std::ffi::CString;
-use std::ffi::c_void;
-use std::net::SocketAddr;
-use std::ptr::null;
-use std::ptr::null_mut;
+// Callback for processing DNS-SD socket events
+unsafe extern "C-unwind" fn socket_callback(
+    _s: *mut CFSocket,
+    _type: objc2_core_foundation::CFSocketCallBackType,
+    _address: *const objc2_core_foundation::CFData,
+    _data: *const std::ffi::c_void,
+    info: *mut std::ffi::c_void,
+) {
+    let sd_ref = info as ffi::DNSServiceRef;
+    let err = unsafe { ffi::DNSServiceProcessResult(sd_ref) };
+    if err != ffi::DNSServiceErrorType::NoError {
+        eprintln!("DNSServiceProcessResult error: {:?}", err);
+    }
+}
 
-use objc2_core_foundation::kCFRunLoopDefaultMode;
-use objc2_core_foundation::{CFRunLoop, CFSocket, CFSocketContext, kCFAllocatorDefault};
+/// Request to add a socket source to the background runloop
+struct AddSourceRequest {
+    fd: i32,
+    sd_ref: ffi::DNSServiceRef,
+    response_tx: mpsc::Sender<Result<(), DNSError>>,
+}
+
+// AddSourceRequest contains raw pointers which are safe to send across threads
+// since they're opaque library-managed pointers that don't have affinity to any thread
+unsafe impl Send for AddSourceRequest {}
+
+/// Manages the background event loop thread for DNS-SD operations.
+/// Uses reference counting - the thread runs as long as at least one DNSService exists.
+struct EventLoopManager {
+    _thread_handle: Mutex<Option<thread::JoinHandle<()>>>,
+    stop_tx: Mutex<Option<mpsc::Sender<()>>>,
+    add_source_tx: Mutex<mpsc::Sender<AddSourceRequest>>,
+}
+
+impl std::fmt::Debug for EventLoopManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventLoopManager").finish()
+    }
+}
+
+impl EventLoopManager {
+    /// Create and start the event loop thread.
+    fn new() -> Arc<Self> {
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let (add_source_tx, add_source_rx) = mpsc::channel::<AddSourceRequest>();
+        
+        let handle = thread::spawn(move || {
+            event_loop_thread_run(stop_rx, add_source_rx);
+        });
+        
+        Arc::new(EventLoopManager {
+            _thread_handle: Mutex::new(Some(handle)),
+            stop_tx: Mutex::new(Some(stop_tx)),
+            add_source_tx: Mutex::new(add_source_tx),
+        })
+    }
+    
+    /// Request to add a socket source to the background runloop
+    fn add_source(&self, fd: i32, sd_ref: ffi::DNSServiceRef) -> Result<(), DNSError> {
+        let (response_tx, response_rx) = mpsc::channel();
+        
+        let request = AddSourceRequest {
+            fd,
+            sd_ref,
+            response_tx,
+        };
+        
+        if let Ok(tx) = self.add_source_tx.lock() {
+            tx.send(request).map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))?;
+        } else {
+            return Err(DNSError(ffi::DNSServiceErrorType::Unknown));
+        }
+        
+        // Wait for the background thread to process the request
+        response_rx.recv().map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))?
+    }
+}
+
+impl Drop for EventLoopManager {
+    fn drop(&mut self) {
+        // Signal the thread to stop by dropping the sender
+        if let Ok(mut tx_opt) = self.stop_tx.lock() {
+            tx_opt.take(); // Drop sender, causing recv to fail
+        }
+        
+        // Wait for thread to finish
+        if let Ok(mut handle_opt) = self._thread_handle.lock() {
+            if let Some(handle) = handle_opt.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+/// Background thread that runs the CFRunLoop to service DNS-SD events.
+fn event_loop_thread_run(stop_rx: mpsc::Receiver<()>, add_source_rx: mpsc::Receiver<AddSourceRequest>) {
+    // Each thread has its own CFRunLoop. Use current() on this background thread,
+    // not main() which would return the main thread's runloop.
+    let runloop = CFRunLoop::current().unwrap();
+    
+    loop {
+        // Check if we've been signaled to stop
+        match stop_rx.try_recv() {
+            Ok(_) | Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {
+                // Continue running
+            }
+        }
+        
+        // Check for pending source requests
+        loop {
+            match add_source_rx.try_recv() {
+                Ok(request) => {
+                    let result = add_source_to_runloop(&runloop, request.fd, request.sd_ref);
+                    let _ = request.response_tx.send(result);
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return,
+            }
+        }
+        
+        // Run the event loop with a 100ms timeout to check for stop signal
+        unsafe {
+            CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, 0.1, false);
+        }
+    }
+}
+
+/// Add a socket source for the given fd to the runloop (called from background thread)
+fn add_source_to_runloop(runloop: &CFRunLoop, fd: i32, sd_ref: ffi::DNSServiceRef) -> Result<(), DNSError> {
+    if fd < 0 {
+        return Err(DNSError(ffi::DNSServiceErrorType::Unknown));
+    }
+    
+    unsafe {
+        let mut context = CFSocketContext {
+            version: 0,
+            info: sd_ref as *mut _,
+            retain: None,
+            release: None,
+            copyDescription: None,
+        };
+
+        let cf_sock = match CFSocket::with_native(
+            kCFAllocatorDefault,
+            fd,
+            1, // kCFSocketReadCallBack = 1
+            Some(socket_callback),
+            &mut context,
+        ) {
+            Some(sock) => sock,
+            None => return Err(DNSError(ffi::DNSServiceErrorType::Unknown)),
+        };
+
+        let sock_ref: &objc2_core_foundation::CFSocket = cf_sock.as_ref();
+        let rl_source = match CFSocket::new_run_loop_source(kCFAllocatorDefault, Some(sock_ref), 0) {
+            Some(src) => src,
+            None => return Err(DNSError(ffi::DNSServiceErrorType::Unknown)),
+        };
+
+        runloop.add_source(Some(&rl_source), kCFRunLoopDefaultMode);
+    }
+    
+    Ok(())
+}
+
+/// Get or create the global event loop manager.
+fn get_event_loop_manager() -> Arc<EventLoopManager> {
+    static MANAGER: OnceLock<Arc<EventLoopManager>> = OnceLock::new();
+    
+    MANAGER
+        .get_or_init(|| EventLoopManager::new())
+        .clone()
+}
 
 #[allow(non_upper_case_globals)]
 mod ffi {
@@ -154,6 +333,7 @@ mod ffi {
 #[derive(Debug)]
 pub struct DNSService {
     sd_ref: ffi::DNSServiceRef,
+    _event_loop: Arc<EventLoopManager>,
 }
 
 // No longer needed: DispatchContext
@@ -166,6 +346,7 @@ pub struct DNSService {
 pub struct DNSRecord {
     sd_ref: ffi::DNSServiceRef,
     rec_ref: ffi::DNSRecordRef,
+    _event_loop: Arc<EventLoopManager>,
 }
 
 #[derive(Debug)]
@@ -244,7 +425,10 @@ impl DNSService {
         drop(txt_data);
 
         if err == ffi::DNSServiceErrorType::NoError {
-            Ok(DNSService { sd_ref: sd_ref })
+            Ok(DNSService {
+                sd_ref: sd_ref,
+                _event_loop: get_event_loop_manager(),
+            })
         } else {
             Err(DNSError(err))
         }
@@ -260,7 +444,10 @@ impl DNSService {
         if err != ffi::DNSServiceErrorType::NoError {
             return Err(DNSError(err));
         }
-        Ok(DNSService { sd_ref })
+        Ok(DNSService {
+            sd_ref,
+            _event_loop: get_event_loop_manager(),
+        })
     }
 
     /// Register an address record (A for IPv4, AAAA for IPv6) on this connection.
@@ -307,7 +494,6 @@ impl DNSService {
 
         let err = match addr {
             SocketAddr::V4(a) => {
-                // let raw_ip = u32::to_be((*a.ip()).into());
                 let raw_ip = a.ip().octets();
                 unsafe {
                     ffi::DNSServiceRegisterRecord(
@@ -327,7 +513,6 @@ impl DNSService {
                 }
             }
             SocketAddr::V6(a) => {
-                // let raw_ip = u128::to_be_bytes((*a.ip()).into());
                 let raw_ip = a.ip().octets();
                 unsafe {
                     ffi::DNSServiceRegisterRecord(
@@ -348,67 +533,20 @@ impl DNSService {
             }
         };
 
-        // --- RunLoop socket integration ---
-        unsafe extern "C-unwind" fn socket_callback(
-            _s: *mut CFSocket,
-            _type: objc2_core_foundation::CFSocketCallBackType,
-            _address: *const objc2_core_foundation::CFData,
-            _data: *const std::ffi::c_void,
-            info: *mut std::ffi::c_void,
-        ) {
-            let sd_ref = info as ffi::DNSServiceRef;
-            let err = unsafe { ffi::DNSServiceProcessResult(sd_ref) };
-            if err != ffi::DNSServiceErrorType::NoError {
-                eprintln!("DNSServiceProcessResult error: {:?}", err);
-            }
-        }
+        drop(fullname);
 
+        // Request the background thread to add the socket source to its runloop
         unsafe {
             let fd = ffi::DNSServiceRefSockFD(self.sd_ref);
-            if fd < 0 {
-                return Err(DNSError(ffi::DNSServiceErrorType::Unknown));
-            }
-
-            let mut context = CFSocketContext {
-                version: 0,
-                info: self.sd_ref as *mut _,
-                retain: None,
-                release: None,
-                copyDescription: None,
-            };
-
-            let cf_sock = CFSocket::with_native(
-                kCFAllocatorDefault,
-                fd,
-                1, // kCFSocketReadCallBack = 1
-                Some(socket_callback),
-                &mut context,
-            );
-            let cf_sock = match cf_sock {
-                Some(sock) => sock,
-                None => return Err(DNSError(ffi::DNSServiceErrorType::Unknown)),
-            };
-
-            let sock_ref: &objc2_core_foundation::CFSocket = cf_sock.as_ref();
-            let rl_source = CFSocket::new_run_loop_source(kCFAllocatorDefault, Some(sock_ref), 0);
-            let rl_source = match rl_source {
-                Some(src) => src,
-                None => return Err(DNSError(ffi::DNSServiceErrorType::Unknown)),
-            };
-
-            let runloop = CFRunLoop::main().unwrap();
-            runloop.add_source(Some(&rl_source), kCFRunLoopDefaultMode);
-
-            // Run the loop until stopped in the callback
-            CFRunLoop::run();
+            let event_loop = get_event_loop_manager();
+            event_loop.add_source(fd, self.sd_ref)?;
         }
-
-        drop(fullname);
 
         if err == ffi::DNSServiceErrorType::NoError {
             Ok(DNSRecord {
                 sd_ref: self.sd_ref,
                 rec_ref,
+                _event_loop: get_event_loop_manager(),
             })
         } else {
             Err(DNSError(err))
