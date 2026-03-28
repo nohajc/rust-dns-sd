@@ -189,6 +189,12 @@ fn add_source_to_runloop(runloop: &CFRunLoop, fd: i32, sd_ref: ffi::DNSServiceRe
         };
 
         runloop.add_source(Some(&rl_source), kCFRunLoopDefaultMode);
+
+        // IMPORTANT: Leak the CFSocket to keep it alive.
+        // The runloop source holds a reference to the socket but doesn't keep it alive
+        // on its own. By leaking it, we ensure the socket remains valid for the
+        // entire lifetime of the background thread.
+        std::mem::forget(cf_sock);
     }
     
     Ok(())
