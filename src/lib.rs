@@ -1,19 +1,43 @@
-extern crate libc;
+// Minimal callback for DNSServiceRegisterRecord (required by API)
+extern "C" fn register_record_callback(
+    _sdref: ffi::DNSServiceRef,
+    _rec: ffi::DNSRecordRef,
+    _flags: ffi::DNSServiceFlags,
+    error: ffi::DNSServiceErrorType,
+    _context: *mut c_void,
+) {
+    if error != ffi::DNSServiceErrorType::NoError {
+        eprintln!("DNSServiceRegisterRecord callback error: {:?}", error);
+    } else {
+        println!("DNSServiceRegisterRecord callback: record registered successfully.");
+    }
 
+    CFRunLoop::stop(&CFRunLoop::main().unwrap());
+}
+
+use std::ffi::CString;
+use std::ffi::c_void;
+use std::net::SocketAddr;
 use std::ptr::null;
 use std::ptr::null_mut;
-use std::ffi::CString;
 
+use objc2_core_foundation::kCFRunLoopDefaultMode;
+use objc2_core_foundation::{CFRunLoop, CFSocket, CFSocketContext, kCFAllocatorDefault};
+
+#[allow(non_upper_case_globals)]
 mod ffi {
-    use libc::c_void;
     use libc::c_char;
+    use libc::c_void;
 
     pub enum DNSService {}
     pub type DNSServiceRef = *mut DNSService;
 
+    pub enum DNSRecord {}
+    pub type DNSRecordRef = *mut DNSRecord;
+
     #[repr(i32)]
     #[allow(dead_code)]
-    #[derive(Copy,Clone,Debug,PartialEq,Eq)]
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub enum DNSServiceErrorType {
         NoError = 0,
         Unknown = -65537,
@@ -50,37 +74,98 @@ mod ffi {
     }
 
     pub type DNSServiceFlags = u32;
-    pub type DNSServiceRegisterReply = Option<extern "C" fn(DNSServiceRef,
-                                                            DNSServiceFlags,
-                                                            DNSServiceErrorType,
-                                                            *const c_char,
-                                                            *const c_char,
-                                                            *const c_char,
-                                                            *mut c_void)
-                                                           >;
 
-    extern "C" {
-        pub fn DNSServiceRegister(sdRef: *mut DNSServiceRef,
-                                  flags: DNSServiceFlags,
-                                  interfaceIndex: u32,
-                                  name: *const c_char,
-                                  regtype: *const c_char,
-                                  domain: *const c_char,
-                                  host: *const c_char,
-                                  port: u16,
-                                  txtLen: u16,
-                                  txtRecord: *const u8,
-                                  callBack: DNSServiceRegisterReply,
-                                  context: *mut c_void)
-                                  -> DNSServiceErrorType;
+    pub const kDNSServiceFlagsUnique: DNSServiceFlags = 0x20;
+
+    pub const kDNSServiceType_A: u16 = 1;
+    pub const kDNSServiceType_AAAA: u16 = 28;
+    pub const kDNSServiceClass_IN: u16 = 1;
+
+    pub type DNSServiceRegisterReply = Option<
+        extern "C" fn(
+            DNSServiceRef,
+            DNSServiceFlags,
+            DNSServiceErrorType,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            *mut c_void,
+        ),
+    >;
+
+    pub type DNSServiceRegisterRecordReply = Option<
+        extern "C" fn(
+            DNSServiceRef,
+            DNSRecordRef,
+            DNSServiceFlags,
+            DNSServiceErrorType,
+            *mut c_void,
+        ),
+    >;
+
+    unsafe extern "C" {
+        pub fn DNSServiceRegister(
+            sdRef: *mut DNSServiceRef,
+            flags: DNSServiceFlags,
+            interfaceIndex: u32,
+            name: *const c_char,
+            regtype: *const c_char,
+            domain: *const c_char,
+            host: *const c_char,
+            port: u16,
+            txtLen: u16,
+            txtRecord: *const u8,
+            callBack: DNSServiceRegisterReply,
+            context: *mut c_void,
+        ) -> DNSServiceErrorType;
+
+        pub fn DNSServiceCreateConnection(sdRef: *mut DNSServiceRef) -> DNSServiceErrorType;
+
+        pub fn DNSServiceRegisterRecord(
+            sdRef: DNSServiceRef,
+            RecordRef: *mut DNSRecordRef,
+            flags: DNSServiceFlags,
+            interfaceIndex: u32,
+            fullname: *const c_char,
+            rrtype: u16,
+            rrclass: u16,
+            rdlen: u16,
+            rdata: *const u8,
+            ttl: u32,
+            callBack: DNSServiceRegisterRecordReply,
+            context: *mut c_void,
+        ) -> DNSServiceErrorType;
+
+        pub fn DNSServiceRemoveRecord(
+            sdRef: DNSServiceRef,
+            RecordRef: DNSRecordRef,
+            flags: DNSServiceFlags,
+        ) -> DNSServiceErrorType;
 
         pub fn DNSServiceRefDeallocate(sdRef: DNSServiceRef);
+
+        pub fn DNSServiceRefSockFD(sdRef: DNSServiceRef) -> i32;
+        pub fn DNSServiceProcessResult(sdRef: DNSServiceRef) -> DNSServiceErrorType;
+
+        // No need for direct FFI for CFSocket/CFRunLoop; use Rust wrappers
     }
 }
 
 #[derive(Debug)]
 pub struct DNSService {
     sd_ref: ffi::DNSServiceRef,
+}
+
+// No longer needed: DispatchContext
+
+/// A registered DNS record (A or AAAA) on a connection-based [`DNSService`].
+///
+/// Dropping this value deregisters the record via `DNSServiceRemoveRecord`.
+/// The parent [`DNSService`] must outlive this value.
+#[derive(Debug)]
+pub struct DNSRecord {
+    sd_ref: ffi::DNSServiceRef,
+    rec_ref: ffi::DNSRecordRef,
 }
 
 #[derive(Debug)]
@@ -98,21 +183,30 @@ impl std::error::Error for DNSError {
     }
 }
 
+impl Drop for DNSRecord {
+    fn drop(&mut self) {
+        unsafe {
+            ffi::DNSServiceRemoveRecord(self.sd_ref, self.rec_ref, 0);
+        }
+    }
+}
+
 impl DNSService {
-    pub fn register(name: Option<&str>,
-                    regtype: &str,
-                    domain: Option<&str>,
-                    host: Option<&str>,
-                    port: u16,
-                    txt: &[&str])
-                    -> std::result::Result<DNSService, DNSError> {
+    /// Register a service advertisement (equivalent to `dns-sd -R`).
+    pub fn register(
+        name: Option<&str>,
+        regtype: &str,
+        domain: Option<&str>,
+        host: Option<&str>,
+        port: u16,
+        txt: &[&str],
+    ) -> std::result::Result<DNSService, DNSError> {
         let mut sd_ref: ffi::DNSServiceRef = null_mut();
 
-        let txt_data: Vec<u8> = txt.into_iter()
-                                   .flat_map(|value| {
-                                       std::iter::once(value.len() as u8).chain(value.bytes())
-                                   })
-                                   .collect();
+        let txt_data: Vec<u8> = txt
+            .into_iter()
+            .flat_map(|value| std::iter::once(value.len() as u8).chain(value.bytes()))
+            .collect();
 
         let name = name.map(|s| CString::new(s).unwrap());
         let regtype = CString::new(regtype).unwrap();
@@ -120,22 +214,24 @@ impl DNSService {
         let host = host.map(|s| CString::new(s).unwrap());
 
         let err = unsafe {
-            ffi::DNSServiceRegister(&mut sd_ref as *mut _,
-                                    0,
-                                    0,
-                                    name.as_ref().map_or(null(), |s| s.as_ptr()),
-                                    regtype.as_ptr(),
-                                    domain.as_ref().map_or(null(), |s| s.as_ptr()),
-                                    host.as_ref().map_or(null(), |s| s.as_ptr()),
-                                    port.to_be(),
-                                    txt_data.len() as u16,
-                                    if txt_data.is_empty() {
-                                        null()
-                                    } else {
-                                        txt_data.as_ptr()
-                                    },
-                                    None,
-                                    null_mut())
+            ffi::DNSServiceRegister(
+                &mut sd_ref as *mut _,
+                0,
+                0,
+                name.as_ref().map_or(null(), |s| s.as_ptr()),
+                regtype.as_ptr(),
+                domain.as_ref().map_or(null(), |s| s.as_ptr()),
+                host.as_ref().map_or(null(), |s| s.as_ptr()),
+                port.to_be(),
+                txt_data.len() as u16,
+                if txt_data.is_empty() {
+                    null()
+                } else {
+                    txt_data.as_ptr()
+                },
+                None,
+                null_mut(),
+            )
         };
 
         // We must be sure these stay are still alive during the DNSServiceRegister call
@@ -149,6 +245,171 @@ impl DNSService {
 
         if err == ffi::DNSServiceErrorType::NoError {
             Ok(DNSService { sd_ref: sd_ref })
+        } else {
+            Err(DNSError(err))
+        }
+    }
+
+    /// Create a connection-based service reference.
+    ///
+    /// The returned [`DNSService`] can be passed to [`DNSService::register_record`]
+    /// to register individual DNS resource records (needed for proxy advertisement).
+    pub fn create_connection() -> std::result::Result<DNSService, DNSError> {
+        let mut sd_ref: ffi::DNSServiceRef = null_mut();
+        let err = unsafe { ffi::DNSServiceCreateConnection(&mut sd_ref as *mut _) };
+        if err != ffi::DNSServiceErrorType::NoError {
+            return Err(DNSError(err));
+        }
+        Ok(DNSService { sd_ref })
+    }
+
+    /// Register an address record (A for IPv4, AAAA for IPv6) on this connection.
+    ///
+    /// `fullname` must be a fully-qualified domain name (e.g. `"myhost.local."`).
+    /// The address and, for IPv6, the interface scope are taken from `addr`.
+    /// The port in `addr` is not used for the DNS record and may be set to `0`.
+    ///
+    /// For link-local IPv6 addresses the `scope_id` of the [`std::net::SocketAddrV6`]
+    /// is used as the interface index passed to `DNSServiceRegisterRecord`.
+    /// Use a correctly-scoped value from a string like `"fe80::1%en0"`.
+    ///
+    /// This is used together with [`DNSService::register`] (specifying the same `host`)
+    /// to implement proxy service advertisement (equivalent to `dns-sd -P`):
+    ///
+    /// ```no_run
+    /// use dns_sd::{DNSService, parse_scoped_ipv6};
+    /// use std::net::SocketAddr;
+    ///
+    /// // Plain IPv4 proxy
+    /// let conn = DNSService::create_connection().unwrap();
+    /// let addr: SocketAddr = "192.0.2.1:0".parse().unwrap();
+    /// let _rec = conn.register_record("myhost.local.", addr).unwrap();
+    /// let _svc = DNSService::register(Some("My Service"), "_http._tcp", None,
+    ///                                 Some("myhost.local."), 80, &[]).unwrap();
+    ///
+    /// // Link-local IPv6 proxy — scope_id carries the interface index
+    /// let conn2 = DNSService::create_connection().unwrap();
+    /// let addr6 = parse_scoped_ipv6("fe80::1%en0").unwrap();
+    /// let _rec2 = conn2.register_record("myhost6.local.", SocketAddr::V6(addr6)).unwrap();
+    /// ```
+    ///
+    /// The [`DNSRecord`] must be kept alive (alongside `self`) for the registration
+    /// to remain active.
+    pub fn register_record(
+        &self,
+        fullname: &str,
+        addr: SocketAddr,
+    ) -> std::result::Result<DNSRecord, DNSError> {
+        let mut rec_ref: ffi::DNSRecordRef = null_mut();
+        let fullname = CString::new(fullname).unwrap();
+
+        println!("DEBUG addr: {:?}", addr);
+
+        let err = match addr {
+            SocketAddr::V4(a) => {
+                // let raw_ip = u32::to_be((*a.ip()).into());
+                let raw_ip = a.ip().octets();
+                unsafe {
+                    ffi::DNSServiceRegisterRecord(
+                        self.sd_ref,
+                        &mut rec_ref as *mut _,
+                        ffi::kDNSServiceFlagsUnique,
+                        0,
+                        fullname.as_ptr(),
+                        ffi::kDNSServiceType_A,
+                        ffi::kDNSServiceClass_IN,
+                        4,
+                        raw_ip.as_ptr(),
+                        240,
+                        Some(register_record_callback),
+                        null_mut(),
+                    )
+                }
+            }
+            SocketAddr::V6(a) => {
+                // let raw_ip = u128::to_be_bytes((*a.ip()).into());
+                let raw_ip = a.ip().octets();
+                unsafe {
+                    ffi::DNSServiceRegisterRecord(
+                        self.sd_ref,
+                        &mut rec_ref as *mut _,
+                        ffi::kDNSServiceFlagsUnique,
+                        a.scope_id(),
+                        fullname.as_ptr(),
+                        ffi::kDNSServiceType_AAAA,
+                        ffi::kDNSServiceClass_IN,
+                        16,
+                        raw_ip.as_ptr(),
+                        240,
+                        Some(register_record_callback),
+                        null_mut(),
+                    )
+                }
+            }
+        };
+
+        // --- RunLoop socket integration ---
+        unsafe extern "C-unwind" fn socket_callback(
+            _s: *mut CFSocket,
+            _type: objc2_core_foundation::CFSocketCallBackType,
+            _address: *const objc2_core_foundation::CFData,
+            _data: *const std::ffi::c_void,
+            info: *mut std::ffi::c_void,
+        ) {
+            let sd_ref = info as ffi::DNSServiceRef;
+            let err = unsafe { ffi::DNSServiceProcessResult(sd_ref) };
+            if err != ffi::DNSServiceErrorType::NoError {
+                eprintln!("DNSServiceProcessResult error: {:?}", err);
+            }
+        }
+
+        unsafe {
+            let fd = ffi::DNSServiceRefSockFD(self.sd_ref);
+            if fd < 0 {
+                return Err(DNSError(ffi::DNSServiceErrorType::Unknown));
+            }
+
+            let mut context = CFSocketContext {
+                version: 0,
+                info: self.sd_ref as *mut _,
+                retain: None,
+                release: None,
+                copyDescription: None,
+            };
+
+            let cf_sock = CFSocket::with_native(
+                kCFAllocatorDefault,
+                fd,
+                1, // kCFSocketReadCallBack = 1
+                Some(socket_callback),
+                &mut context,
+            );
+            let cf_sock = match cf_sock {
+                Some(sock) => sock,
+                None => return Err(DNSError(ffi::DNSServiceErrorType::Unknown)),
+            };
+
+            let sock_ref: &objc2_core_foundation::CFSocket = cf_sock.as_ref();
+            let rl_source = CFSocket::new_run_loop_source(kCFAllocatorDefault, Some(sock_ref), 0);
+            let rl_source = match rl_source {
+                Some(src) => src,
+                None => return Err(DNSError(ffi::DNSServiceErrorType::Unknown)),
+            };
+
+            let runloop = CFRunLoop::main().unwrap();
+            runloop.add_source(Some(&rl_source), kCFRunLoopDefaultMode);
+
+            // Run the loop until stopped in the callback
+            CFRunLoop::run();
+        }
+
+        drop(fullname);
+
+        if err == ffi::DNSServiceErrorType::NoError {
+            Ok(DNSRecord {
+                sd_ref: self.sd_ref,
+                rec_ref,
+            })
         } else {
             Err(DNSError(err))
         }

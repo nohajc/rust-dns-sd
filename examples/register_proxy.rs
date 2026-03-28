@@ -1,0 +1,67 @@
+extern crate dns_sd;
+use dns_sd::DNSService;
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::time::Duration;
+
+/// Plain IPv4 proxy — equivalent of:
+///   dns-sd -P "My Web Server" _http._tcp local 80 myproxy.local 192.0.2.1
+fn register_ipv4_proxy() {
+    let conn = DNSService::create_connection().unwrap();
+
+    // Port is ignored for the A record; use 0.
+    let addr: SocketAddr = "192.0.2.1:0".parse().unwrap();
+    let _rec = conn.register_record("myproxy.local.", addr).unwrap();
+
+    let _svc = DNSService::register(
+        Some("My Web Server"),
+        "_http._tcp",
+        Some("local"),
+        Some("myproxy.local."),
+        80,
+        &["path=/"],
+    )
+    .unwrap();
+
+    println!("IPv4 proxy advertisement active.");
+    std::thread::sleep(Duration::from_secs(30));
+}
+
+/// Link-local IPv6 proxy — equivalent of:
+///   dns-sd -P "My Web Server" _http._tcp local 80 myproxy6.local fe80::1%en0
+fn register_ipv6_proxy() {
+    let conn = DNSService::create_connection().unwrap();
+
+    // Use standard Rust parsing: "[fe80::1%en0]:0" parses to a SocketAddrV6 with correct scope_id.
+    let addr6: SocketAddr = ("fe80::1%en0", 0)
+        .to_socket_addrs()
+        .unwrap()
+        .next()
+        .unwrap();
+    println!(
+        "Registering on interface index {}.",
+        match addr6 {
+            std::net::SocketAddr::V6(ref a) => a.scope_id(),
+            _ => 0,
+        }
+    );
+
+    let _rec = conn.register_record("myproxy6.local.", addr6).unwrap();
+
+    let _svc = DNSService::register(
+        Some("My Web Server v6"),
+        "_http._tcp",
+        Some("local"),
+        Some("myproxy6.local."),
+        80,
+        &["path=/"],
+    )
+    .unwrap();
+
+    println!("IPv6 proxy advertisement active.");
+    std::thread::sleep(Duration::from_secs(30));
+}
+
+fn main() {
+    register_ipv4_proxy();
+    register_ipv6_proxy();
+}

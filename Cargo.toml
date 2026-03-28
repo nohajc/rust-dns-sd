@@ -7,9 +7,11 @@ homepage = "https://github.com/plietar/rust-dns-sd"
 repository = "https://github.com/plietar/rust-dns-sd"
 authors = ["Paul Lietar <paul@lietar.net>"]
 license = "MIT"
+edition = "2024"
 
 [build-dependencies]
 pkg-config = "~0.3.6"
 
 [dependencies]
 libc = "0.2"
+objc2-core-foundation = { version = "0.3.2", features = ["CFRunLoop"] }
