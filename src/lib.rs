@@ -492,6 +492,14 @@ impl DNSService {
 
         println!("DEBUG addr: {:?}", addr);
 
+        // Add the socket source to the runloop BEFORE registering the record
+        // The DNS-SD library needs the socket to be monitored from the start
+        unsafe {
+            let fd = ffi::DNSServiceRefSockFD(self.sd_ref);
+            let event_loop = get_event_loop_manager();
+            event_loop.add_source(fd, self.sd_ref)?;
+        }
+
         let err = match addr {
             SocketAddr::V4(a) => {
                 let raw_ip = a.ip().octets();
@@ -534,13 +542,6 @@ impl DNSService {
         };
 
         drop(fullname);
-
-        // Request the background thread to add the socket source to its runloop
-        unsafe {
-            let fd = ffi::DNSServiceRefSockFD(self.sd_ref);
-            let event_loop = get_event_loop_manager();
-            event_loop.add_source(fd, self.sd_ref)?;
-        }
 
         if err == ffi::DNSServiceErrorType::NoError {
             Ok(DNSRecord {
