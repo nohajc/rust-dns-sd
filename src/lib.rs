@@ -3,11 +3,10 @@ use std::ffi::c_void;
 use std::net::SocketAddr;
 use std::ptr::null;
 use std::ptr::null_mut;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::sync::mpsc;
 
-use objc2_core_foundation::CFRetained;
 use objc2_core_foundation::kCFRunLoopDefaultMode;
 use objc2_core_foundation::{CFRunLoop, CFSocket, CFSocketContext, kCFAllocatorDefault};
 
@@ -25,8 +24,6 @@ extern "C" fn register_record_callback(
     } else {
         // Callback succeeded
     }
-
-    println!("Register record callback called");
     
     // Send the error code (or success) on the channel, consuming the sender
     if !context.is_null() {
@@ -53,34 +50,33 @@ unsafe extern "C-unwind" fn socket_callback(
     }
 }
 
-// enum BackgroundThreadRequest {
-//     Register {
-//         name: Option<String>,
-//         regtype: String,
-//         domain: Option<String>,
-//         host: Option<String>,
-//         port: u16,
-//         txt: Vec<String>,
-//         response_tx: mpsc::Sender<Result<ffi::DNSServiceRef, DNSError>>,
-//     },
-//     CreateConnection {
-//         response_tx: mpsc::Sender<Result<ffi::DNSServiceRef, DNSError>>,
-//     },
-//     RegisterRecord {
-//         sd_ref: ffi::DNSServiceRef,
-//         fullname: String,
-//         addr: SocketAddr,
-//         response_tx: mpsc::Sender<Result<ffi::DNSRecordRef, DNSError>>,
-//         callback_tx: mpsc::Sender<ffi::DNSServiceErrorType>,
-//     },
-// }
+enum BackgroundThreadRequest {
+    Register {
+        name: Option<String>,
+        regtype: String,
+        domain: Option<String>,
+        host: Option<String>,
+        port: u16,
+        txt: Vec<String>,
+        response_tx: mpsc::Sender<Result<ffi::DNSServiceRef, DNSError>>,
+    },
+    CreateConnection {
+        response_tx: mpsc::Sender<Result<ffi::DNSServiceRef, DNSError>>,
+    },
+    RegisterRecord {
+        sd_ref: ffi::DNSServiceRef,
+        fullname: String,
+        addr: SocketAddr,
+        response_tx: mpsc::Sender<Result<ffi::DNSRecordRef, DNSError>>,
+        callback_tx: mpsc::Sender<ffi::DNSServiceErrorType>,
+    },
+}
 
-// unsafe impl Send for BackgroundThreadRequest {}
+unsafe impl Send for BackgroundThreadRequest {}
 
 struct EventLoopManager {
-    // request_tx: mpsc::Sender<BackgroundThreadRequest>,
-    loop_handle: LoopHandle,
-    _thread_handle: Mutex<Option<thread::JoinHandle<()>>>,
+    request_tx: mpsc::Sender<BackgroundThreadRequest>,
+    _thread_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for EventLoopManager {
@@ -91,78 +87,64 @@ impl std::fmt::Debug for EventLoopManager {
 
 impl EventLoopManager {
     fn new() -> Arc<Self> {
-        // let (request_tx, request_rx) = mpsc::channel();
-        let (loop_handle_tx, loop_handle_rx) = mpsc::channel();
+        let (request_tx, request_rx) = mpsc::channel();
 
         let handle = thread::spawn(move || {
-            background_thread_main(loop_handle_tx);
+            background_thread_main(request_rx);
         });
 
         Arc::new(EventLoopManager {
-            // request_tx,
-            loop_handle: loop_handle_rx.recv().expect("Failed to receive loop handle from background thread"),
-            _thread_handle: Mutex::new(Some(handle)),
+            request_tx,
+            _thread_handle: Some(handle),
         })
     }
 }
 
 impl Drop for EventLoopManager {
     fn drop(&mut self) {
-        // let runloop = self.loop_handle.0.as_ref();
-        // CFRunLoop::stop(runloop);
-        // println!("Event loop stop requested. Waiting for background thread to exit...");
-
-        if let Ok(mut handle_opt) = self._thread_handle.lock() {
-            if let Some(handle) = handle_opt.take() {
-                std::mem::forget(handle);
-                println!("Background thread detached.");
-            }
+        if let Some(handle) = self._thread_handle.take() {
+            // Request channel closes when this EventLoopManager is dropped,
+            // which will cause the background thread to exit
+            let _ = handle.join();
         }
     }
 }
 
-struct LoopHandle(CFRetained<CFRunLoop>);
-
-unsafe impl Send for LoopHandle {}
-unsafe impl Sync for LoopHandle {}
-
-fn background_thread_main(loop_handle_tx: mpsc::Sender<LoopHandle>) {
+fn background_thread_main(request_rx: mpsc::Receiver<BackgroundThreadRequest>) {
     let runloop = CFRunLoop::current().unwrap();
-    loop_handle_tx.send(LoopHandle(runloop)).unwrap();
-    CFRunLoop::run();
 
-    // loop {
-    //     // Process all pending requests
-    //     loop {
-    //         match request_rx.try_recv() {
-    //             Ok(request) => {
-    //                 match request {
-    //                     BackgroundThreadRequest::Register { name, regtype, domain, host, port, txt, response_tx } => {
-    //                         let result = unsafe { dns_service_register(&name, &regtype, &domain, &host, port, &txt) };
-    //                         let _ = response_tx.send(result);
-    //                     }
-    //                     BackgroundThreadRequest::CreateConnection { response_tx } => {
-    //                         let result = unsafe { dns_service_create_connection() };
-    //                         let _ = response_tx.send(result);
-    //                     }
-    //                     BackgroundThreadRequest::RegisterRecord { sd_ref, fullname, addr, response_tx, callback_tx } => {
-    //                         let result = unsafe { dns_service_register_record(sd_ref, &fullname, addr, &runloop, callback_tx) };
-    //                         let _ = response_tx.send(result);
-    //                     }
-    //                 }
-    //             }
-    //             Err(mpsc::TryRecvError::Empty) => break,
-    //             Err(mpsc::TryRecvError::Disconnected) => {
-    //                 return;
-    //             }
-    //         }
-    //     }
-        
-    //     // Run the runloop briefly to process callbacks
-    //     unsafe {
-    //         CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, 0.01, true);
-    //     }
-    // }
+    loop {
+        // Block with 10ms timeout waiting for requests
+        // If timeout occurs, run CFRunLoop briefly to process callbacks
+        match request_rx.recv_timeout(std::time::Duration::from_millis(10)) {
+            Ok(request) => {
+                match request {
+                    BackgroundThreadRequest::Register { name, regtype, domain, host, port, txt, response_tx } => {
+                        let result = unsafe { dns_service_register(&name, &regtype, &domain, &host, port, &txt) };
+                        let _ = response_tx.send(result);
+                    }
+                    BackgroundThreadRequest::CreateConnection { response_tx } => {
+                        let result = unsafe { dns_service_create_connection() };
+                        let _ = response_tx.send(result);
+                    }
+                    BackgroundThreadRequest::RegisterRecord { sd_ref, fullname, addr, response_tx, callback_tx } => {
+                        let result = unsafe { dns_service_register_record(sd_ref, &fullname, addr, &runloop, callback_tx) };
+                        let _ = response_tx.send(result);
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Timeout - run CFRunLoop briefly to process callbacks
+                unsafe {
+                    CFRunLoop::run_in_mode(kCFRunLoopDefaultMode, 0.001, true);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // All senders dropped, exit
+                return;
+            }
+        }
+    }
 }
 
 unsafe fn dns_service_register(
@@ -643,28 +625,21 @@ impl DNSService {
         txt: &[&str],
     ) -> Result<DNSService, DNSError> {
         let event_loop = get_event_loop_manager();
-        // let (response_tx, response_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
 
-        // let request = BackgroundThreadRequest::Register {
-        //     name: name.map(|s| s.to_string()),
-        //     regtype: regtype.to_string(),
-        //     domain: domain.map(|s| s.to_string()),
-        //     host: host.map(|s| s.to_string()),
-        //     port,
-        //     txt: txt.iter().map(|s| s.to_string()).collect(),
-        //     response_tx,
-        // };
+        let request = BackgroundThreadRequest::Register {
+            name: name.map(|s| s.to_string()),
+            regtype: regtype.to_string(),
+            domain: domain.map(|s| s.to_string()),
+            host: host.map(|s| s.to_string()),
+            port,
+            txt: txt.iter().map(|s| s.to_string()).collect(),
+            response_tx,
+        };
 
-        // event_loop.request_tx.send(request).map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))?;
-        // let sd_ref = response_rx.recv().map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))??;
+        event_loop.request_tx.send(request).map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))?;
+        let sd_ref = response_rx.recv().map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))??;
 
-        let name = name.map(|s| s.to_string());
-        let regtype = regtype.to_string();
-        let domain = domain.map(|s| s.to_string());
-        let host = host.map(|s| s.to_string());
-        let txt: Vec<_> = txt.iter().map(|s| s.to_string()).collect();
-
-        let sd_ref = unsafe { dns_service_register(&name, &regtype, &domain, &host, port, &txt) }?;
         Ok(DNSService {
             sd_ref,
             _event_loop: event_loop,
@@ -710,13 +685,13 @@ impl DNSService {
     /// [`DNSError`] if the connection cannot be created.
     pub fn create_connection() -> Result<DNSService, DNSError> {
         let event_loop = get_event_loop_manager();
-        // let (response_tx, response_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
 
-        // let request = BackgroundThreadRequest::CreateConnection { response_tx };
+        let request = BackgroundThreadRequest::CreateConnection { response_tx };
 
-        // event_loop.request_tx.send(request).map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))?;
-        // let sd_ref = response_rx.recv().map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))??;
-        let sd_ref = unsafe { dns_service_create_connection() }?;
+        event_loop.request_tx.send(request).map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))?;
+        let sd_ref = response_rx.recv().map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))??;
+
         Ok(DNSService {
             sd_ref,
             _event_loop: event_loop,
@@ -783,22 +758,20 @@ impl DNSService {
         fullname: &str,
         addr: SocketAddr,
     ) -> Result<DNSRecord, DNSError> {
-        // let (response_tx, response_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
         let (callback_tx, callback_rx) = mpsc::channel();
 
-        // let request = BackgroundThreadRequest::RegisterRecord {
-        //     sd_ref: self.sd_ref,
-        //     fullname: fullname.to_string(),
-        //     addr,
-        //     response_tx,
-        //     callback_tx,
-        // };
+        let request = BackgroundThreadRequest::RegisterRecord {
+            sd_ref: self.sd_ref,
+            fullname: fullname.to_string(),
+            addr,
+            response_tx,
+            callback_tx,
+        };
 
-        // self._event_loop.request_tx.send(request).map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))?;
-        // let rec_ref = response_rx.recv().map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))??;
+        self._event_loop.request_tx.send(request).map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))?;
+        let rec_ref = response_rx.recv().map_err(|_| DNSError(ffi::DNSServiceErrorType::Unknown))??;
 
-        let runloop = self._event_loop.loop_handle.0.as_ref();
-        let rec_ref = unsafe { dns_service_register_record(self.sd_ref, &fullname, addr, runloop, callback_tx)? };
         Ok(DNSRecord {
             sd_ref: self.sd_ref,
             rec_ref,

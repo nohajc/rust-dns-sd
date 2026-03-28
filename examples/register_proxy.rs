@@ -16,8 +16,8 @@ fn register_ipv4_proxy() {
 
     // Wait for the registration callback to confirm the record is registered
     // This ensures the record is actively responding to DNS queries before proceeding
-    // rec.wait_for_registration().unwrap();
-    // println!("DNS record registered successfully");
+    rec.wait_for_registration().unwrap();
+    println!("DNS record registered successfully");
 
     // let _svc = DNSService::register(
     //     Some("My Web Server"),
@@ -29,10 +29,10 @@ fn register_ipv4_proxy() {
     // )
     // .unwrap();
 
-    println!("IPv4 proxy advertisement active for 10 seconds...");
+    println!("IPv4 proxy advertisement active for 30 seconds...");
     // The event loop runs automatically in the background.
     // Just keep the DNSService values alive and sleep.
-    thread::sleep(Duration::from_secs(10));
+    thread::sleep(Duration::from_secs(30));
 }
 
 /// Link-local IPv6 proxy — equivalent of:
