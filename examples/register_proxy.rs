@@ -5,23 +5,23 @@ use std::time::Duration;
 use std::thread;
 
 /// Plain IPv4 proxy — equivalent of:
-///   dns-sd -P "My Web Server" _http._tcp local 80 myproxy.local 192.0.2.1
+///   dns-sd -P "My Web Server" _http._tcp local 80 myproxy.local 127.0.0.1
 fn register_ipv4_proxy() {
     let conn = DNSService::create_connection().unwrap();
 
     // Port is ignored for the A record; use 0.
-    let addr: SocketAddr = "192.0.2.1:0".parse().unwrap();
-    let _rec = conn.register_record("myproxy.local.", addr).unwrap();
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let _rec = conn.register_record("myproxy.local", addr).unwrap();
 
-    let _svc = DNSService::register(
-        Some("My Web Server"),
-        "_http._tcp",
-        Some("local"),
-        Some("myproxy.local."),
-        80,
-        &["path=/"],
-    )
-    .unwrap();
+    // let _svc = DNSService::register(
+    //     Some("My Web Server"),
+    //     "_nfs._tcp",
+    //     Some("local"),
+    //     Some("myproxy.local"),
+    //     2049,
+    //     &[],
+    // )
+    // .unwrap();
 
     println!("IPv4 proxy advertisement active for 30 seconds...");
     // The event loop runs automatically in the background.
@@ -34,8 +34,8 @@ fn register_ipv4_proxy() {
 fn register_ipv6_proxy() {
     let conn = DNSService::create_connection().unwrap();
 
-    // Use standard Rust parsing: "[fe80::1%en0]:0" parses to a SocketAddrV6 with correct scope_id.
-    let addr6: SocketAddr = ("fe80::1%en0", 0)
+    // Use standard Rust parsing: "[fe80::1%lo0]:0" parses to a SocketAddrV6 with correct scope_id.
+    let addr6: SocketAddr = ("fe80::1%lo0", 0)
         .to_socket_addrs()
         .unwrap()
         .next()
