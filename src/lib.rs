@@ -3,7 +3,7 @@ use std::ffi::c_void;
 use std::net::SocketAddr;
 use std::ptr::null;
 use std::ptr::null_mut;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc};
 use std::thread;
 use std::sync::mpsc;
 
@@ -90,13 +90,6 @@ impl EventLoopManager {
     }
 }
 
-impl Drop for EventLoopManager {
-    fn drop(&mut self) {
-        // Background thread runs forever via CFRunLoop::run(), no need to stop it.
-        // The thread will exit when the process terminates.
-    }
-}
-
 fn background_thread_main(init_rx: mpsc::Receiver<BackgroundThreadInitRequest>) {
     let runloop = CFRunLoop::current().unwrap();
 
@@ -114,9 +107,7 @@ fn background_thread_main(init_rx: mpsc::Receiver<BackgroundThreadInitRequest>) 
     }
 
     // Now run the event loop forever to process all callbacks
-    unsafe {
-        CFRunLoop::run();
-    }
+    CFRunLoop::run();
 }
 
 unsafe fn dns_service_register(
@@ -281,11 +272,6 @@ unsafe fn dns_service_register_record_direct(
     }
 
     Ok(rec_ref)
-}
-
-fn get_event_loop_manager() -> Arc<EventLoopManager> {
-    static MANAGER: OnceLock<Arc<EventLoopManager>> = OnceLock::new();
-    MANAGER.get_or_init(|| EventLoopManager::new()).clone()
 }
 
 #[allow(non_upper_case_globals)]
@@ -593,7 +579,7 @@ impl DNSService {
         port: u16,
         txt: &[&str],
     ) -> Result<DNSService, DNSError> {
-        let event_loop = get_event_loop_manager();
+        let event_loop = EventLoopManager::new();
         let (response_tx, response_rx) = mpsc::channel();
 
         let request = BackgroundThreadInitRequest::Register {
@@ -657,7 +643,7 @@ impl DNSService {
     /// Returns a [`DNSService`] that can be used to register DNS records, or a
     /// [`DNSError`] if the connection cannot be created.
     pub fn create_connection() -> Result<DNSService, DNSError> {
-        let event_loop = get_event_loop_manager();
+        let event_loop = EventLoopManager::new();
         let (response_tx, response_rx) = mpsc::channel();
 
         let request = BackgroundThreadInitRequest::CreateConnection { response_tx };
