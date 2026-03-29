@@ -11,7 +11,7 @@ fn register_ipv4_proxy() {
 
     // Port is ignored for the A record; use 0.
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let mut rec = conn.register_record("myproxy.local", addr).unwrap();
+    let mut rec = conn.register_record("myproxy.local", addr, Some("lo0")).unwrap();
     println!("DNS record requested");
 
     // Wait for the registration callback to confirm the record is registered
@@ -54,7 +54,7 @@ fn register_ipv6_proxy() {
         }
     );
 
-    let mut rec = conn.register_record("myproxy6.local", addr6).unwrap();
+    let mut rec = conn.register_record("myproxy6.local", addr6, Some("lo0")).unwrap();
 
     // Wait for the record registration callback before registering the service
     rec.wait_for_registration().unwrap();
@@ -66,6 +66,7 @@ fn register_ipv6_proxy() {
         Some("local"),
         Some("myproxy6.local."),
         80,
+        Some("lo0"),
         &["path=/"],
     )
     .unwrap();

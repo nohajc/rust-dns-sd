@@ -1,4 +1,5 @@
 use std::ffi::CString;
+use std::ffi::OsStr;
 use std::ffi::c_void;
 use std::net::SocketAddr;
 use std::ptr::null;
@@ -7,6 +8,7 @@ use std::sync::{Arc};
 use std::thread;
 use std::sync::mpsc;
 
+use nix::net::if_::if_nametoindex;
 use objc2_core_foundation::kCFRunLoopDefaultMode;
 use objc2_core_foundation::{CFRunLoop, CFSocket, CFSocketContext, kCFAllocatorDefault};
 
@@ -58,6 +60,7 @@ enum BackgroundThreadInitRequest {
         domain: Option<String>,
         host: Option<String>,
         port: u16,
+        if_idx: u32,
         txt: Vec<String>,
         response_tx: mpsc::Sender<Result<ffi::DNSServiceRef, DNSError>>,
     },
@@ -95,8 +98,8 @@ fn background_thread_main(init_rx: mpsc::Receiver<BackgroundThreadInitRequest>) 
 
     // Wait for one initialization request
     match init_rx.recv() {
-        Ok(BackgroundThreadInitRequest::Register { name, regtype, domain, host, port, txt, response_tx }) => {
-            let result = unsafe { dns_service_register(&name, &regtype, &domain, &host, port, &txt) };
+        Ok(BackgroundThreadInitRequest::Register { name, regtype, domain, host, port, if_idx, txt, response_tx }) => {
+            let result = unsafe { dns_service_register(&name, &regtype, &domain, &host, port, if_idx, &txt) };
             let _ = response_tx.send(result);
         }
         Ok(BackgroundThreadInitRequest::CreateConnection { response_tx }) => {
@@ -116,6 +119,7 @@ unsafe fn dns_service_register(
     domain: &Option<String>,
     host: &Option<String>,
     port: u16,
+    if_idx: u32,
     txt: &[String],
 ) -> Result<ffi::DNSServiceRef, DNSError> {
     let mut sd_ref: ffi::DNSServiceRef = null_mut();
@@ -134,7 +138,7 @@ unsafe fn dns_service_register(
         ffi::DNSServiceRegister(
             &mut sd_ref,
             0,
-            0,
+            if_idx,
             name_c.as_ref().map_or(null(), |s| s.as_ptr()),
             regtype_c.as_ptr(),
             domain_c.as_ref().map_or(null(), |s| s.as_ptr()),
@@ -214,6 +218,7 @@ unsafe fn dns_service_register_record_direct(
     sd_ref: ffi::DNSServiceRef,
     fullname: &str,
     addr: SocketAddr,
+    if_idx: u32,
     callback_tx: mpsc::Sender<ffi::DNSServiceErrorType>,
 ) -> Result<ffi::DNSRecordRef, DNSError> {
     let mut rec_ref: ffi::DNSRecordRef = null_mut();
@@ -230,7 +235,7 @@ unsafe fn dns_service_register_record_direct(
                     sd_ref,
                     &mut rec_ref,
                     ffi::kDNSServiceFlagsUnique,
-                    0,
+                    if_idx,
                     fullname_c.as_ptr(),
                     ffi::kDNSServiceType_A,
                     ffi::kDNSServiceClass_IN,
@@ -244,12 +249,14 @@ unsafe fn dns_service_register_record_direct(
         }
         SocketAddr::V6(a) => {
             let raw_ip = a.ip().octets();
+            // non-zero if_idx argument takes precedence over scope_id in the address
+            let if_idx = if if_idx > 0 { if_idx } else { a.scope_id() };
             unsafe {
                 ffi::DNSServiceRegisterRecord(
                     sd_ref,
                     &mut rec_ref,
                     ffi::kDNSServiceFlagsUnique,
-                    a.scope_id(),
+                    if_idx,
                     fullname_c.as_ptr(),
                     ffi::kDNSServiceType_AAAA,
                     ffi::kDNSServiceClass_IN,
@@ -542,6 +549,8 @@ impl DNSService {
     /// * `host` - Optional fully-qualified hostname. If provided with `create_connection`
     ///   and `register_record`, this enables proxy advertisement for other hosts.
     /// * `port` - The port number on which the service is accessible.
+    /// * `if_name` - Optional interface name to bind to (e.g., `"en0"`). If `None`, the
+    ///   service is advertised on all interfaces.
     /// * `txt` - Text records (key-value pairs) providing additional service metadata.
     ///
     /// # Lifetime Requirements
@@ -560,6 +569,7 @@ impl DNSService {
     ///     Some("local"),
     ///     None,
     ///     8080,
+    ///     None,
     ///     &["path=/api", "version=1.0"],
     /// )?;
     ///
@@ -577,10 +587,13 @@ impl DNSService {
         domain: Option<&str>,
         host: Option<&str>,
         port: u16,
+        if_name: Option<&str>,
         txt: &[&str],
     ) -> Result<DNSService, DNSError> {
         let event_loop = EventLoopManager::new();
         let (response_tx, response_rx) = mpsc::channel();
+
+        let if_idx = get_interface_index(if_name);
 
         let request = BackgroundThreadInitRequest::Register {
             name: name.map(|s| s.to_string()),
@@ -588,6 +601,7 @@ impl DNSService {
             domain: domain.map(|s| s.to_string()),
             host: host.map(|s| s.to_string()),
             port,
+            if_idx,
             txt: txt.iter().map(|s| s.to_string()).collect(),
             response_tx,
         };
@@ -672,6 +686,8 @@ impl DNSService {
     ///   address is ignored and can be set to `0`. For IPv6 link-local addresses with
     ///   a scope ID (e.g., `"fe80::1%en0"`), the scope ID becomes the interface index
     ///   passed to the DNS-SD library.
+    /// * `if_name` - Optional interface name to bind to (e.g., `"en0"`). If `None`, the
+    ///   record is advertised on all interfaces.
     ///
     /// # Non-blocking Behavior
     ///
@@ -699,7 +715,7 @@ impl DNSService {
     ///
     /// let conn = DNSService::create_connection()?;
     /// let addr: SocketAddr = "192.0.2.1:0".parse()?;
-    /// let mut record = conn.register_record("myhost.local.", addr)?;
+    /// let mut record = conn.register_record("myhost.local.", addr, None)?;
     ///
     /// // Record returned immediately, but registration might still be pending
     /// // Wait for callback completion if needed (e.g., before mounting)
@@ -715,11 +731,13 @@ impl DNSService {
         &self,
         fullname: &str,
         addr: SocketAddr,
+        if_name: Option<&str>,
     ) -> Result<DNSRecord, DNSError> {
         let (callback_tx, callback_rx) = mpsc::channel();
 
+        let if_idx = get_interface_index(if_name);
         let rec_ref = unsafe {
-            dns_service_register_record_direct(self.sd_ref, fullname, addr, callback_tx)?
+            dns_service_register_record_direct(self.sd_ref, fullname, addr, if_idx, callback_tx)?
         };
 
         Ok(DNSRecord {
@@ -728,5 +746,12 @@ impl DNSService {
             _event_loop: self._event_loop.clone(),
             callback_rx,
         })
+    }
+}
+
+fn get_interface_index(if_name: Option<impl AsRef<OsStr>>) -> u32 {
+    match if_name {
+        Some(name) => if_nametoindex(name.as_ref()).unwrap_or(0),
+        None => 0,
     }
 }
